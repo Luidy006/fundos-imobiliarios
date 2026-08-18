@@ -1,11 +1,10 @@
 streamlit
-pgmpy
-pandas-datareader
-beautifulsoup4
+pandas
+numpy
 requests
+beautifulsoup4
 scikit-learn
 matplotlib
-seaborn
 yfinance
-python-bcb
-pgmpy==0.1.23
+pgmpy
+setuptools
