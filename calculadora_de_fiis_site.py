@@ -39,11 +39,27 @@ HEADERS = {
 }
 
 st.set_page_config(page_title="Recomendador de FIIs com Rede Bayesiana", layout="wide")
-st.title("🏢 Recomendador Inteligente de Fundos Imobiliários")
-st.markdown("---")
+st.markdown(
+    """
+    <style>
+    .watermark-luidy {
+        position: fixed;
+        bottom: 8px;
+        right: 14px;
+        font-size: 12px;
+        color: rgba(150, 150, 150, 0.55);
+        z-index: 9999;
+        pointer-events: none;
+        user-select: none;
+    }
+    </style>
+    <div class="watermark-luidy">Criado por Luidy Senra</div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ============================================================
-# LISTA DE FIIs E DADOS ESTÁTICOS
+# LISTA DE FIIs E DADOS ESTÁTICOS (fallback caso a busca dinâmica falhe)
 # ============================================================
 STATIC_TICKERS = [
     "HGLG11","KNRI11","XPML11","VISC11","BTLG11","MXRF11","CPTS11","RBRR11",
@@ -100,6 +116,88 @@ def try_get(url, timeout=15, retries=2, headers=None):
         except Exception:
             time.sleep(1)
     return None
+
+def _parse_br_number(x) -> float:
+    """Converte números no formato brasileiro ('1.234,56' ou '8,90%') para float."""
+    if x is None:
+        return np.nan
+    s = str(x).strip().replace("%", "").replace("\xa0", "")
+    if s in ("", "-", "nan", "None"):
+        return np.nan
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return np.nan
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_fii_universe(max_tickers: int = 400):
+    """
+    Busca a lista COMPLETA de FIIs negociados na B3 (via Fundamentus) em uma única
+    requisição, já com fundamentos (preço, DY, P/VP, vacância, liquidez, segmento).
+    Como essa página só lista fundos atualmente negociados, fundos incorporados/
+    liquidados (ex.: MORC11) somem de lá automaticamente — sem precisar manter
+    uma lista estática que envelhece.
+    Mantém apenas fundos com liquidez > 0 (negociados de fato) e ordena pelos
+    mais líquidos primeiro, para priorizar os fundos "clássicos" (GARE11, MXRF11 etc).
+    """
+    try:
+        resp = requests.get(
+            "https://www.fundamentus.com.br/fii_resultado.php",
+            headers=HEADERS, timeout=20, verify=False,
+        )
+        resp.encoding = "iso-8859-1"
+        soup = BeautifulSoup(resp.text, "html.parser")
+        table = None
+        for cand in soup.find_all("table"):
+            thead = cand.find("thead")
+            if thead and "Papel" in thead.get_text():
+                table = cand
+                break
+        if table is None:
+            raise ValueError("Tabela de resultados não encontrada na página do Fundamentus")
+        header_cells = [th.get_text(strip=True) for th in table.find("thead").find_all("th")]
+        rows = []
+        for tr in table.find("tbody").find_all("tr"):
+            cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if len(cells) == len(header_cells):
+                rows.append(cells)
+        raw = pd.DataFrame(rows, columns=header_cells)
+    except Exception as e:
+        logger.warning(f"Falha ao buscar universo de FIIs no Fundamentus: {e}")
+        tickers = sorted(set([t.upper() for t in STATIC_TICKERS if isinstance(t, str) and t.endswith("11")]))
+        return tickers[:max_tickers], STATIC_FUNDAMENTALS.copy()
+
+
+    raw.columns = [str(c).strip() for c in raw.columns]
+    col_map = {
+        "Papel": "Ticker", "Segmento": "Segmento", "Cotação": "Preco",
+        "Dividend Yield": "DY", "P/VP": "P/VP", "Liquidez": "Liquidez",
+        "Vacância Média": "Vacancia",
+    }
+    faltando = [c for c in col_map if c not in raw.columns]
+    if faltando:
+        logger.warning(f"Colunas ausentes no Fundamentus: {faltando}")
+        tickers = sorted(set([t.upper() for t in STATIC_TICKERS if isinstance(t, str) and t.endswith("11")]))
+        return tickers[:max_tickers], STATIC_FUNDAMENTALS.copy()
+
+    df = raw[list(col_map.keys())].rename(columns=col_map)
+    df["Ticker"] = df["Ticker"].astype(str).str.strip().str.upper()
+    for col in ["Preco", "DY", "P/VP", "Liquidez", "Vacancia"]:
+        df[col] = df[col].apply(_parse_br_number)
+
+    # Só fundos "clássicos" (código termina em 11, exclui frações/direitos como 11B)
+    df = df[df["Ticker"].str.match(r"^[A-Z]{4}11$")]
+    # Só fundos com liquidez > 0, ou seja, negociados de fato (exclui fundos "fantasmas"/sem giro)
+    df = df[df["Liquidez"].fillna(0) > 0]
+    df = df.drop_duplicates(subset="Ticker").sort_values("Liquidez", ascending=False)
+    df["Liquidez"] = df["Liquidez"] / 1_000_000  # padroniza em R$ milhões, como o resto do app espera
+
+    df = df.head(max_tickers)
+    tickers = df["Ticker"].tolist()
+    fundamentals = df.set_index("Ticker")[["Preco", "P/VP", "DY", "Vacancia", "Liquidez", "Segmento"]]
+    logger.info(f"Universo de FIIs coletado: {len(tickers)} fundos ativos e líquidos")
+    return tickers, fundamentals
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_bcb_series(codes: List[int], name: str) -> pd.Series:
@@ -190,66 +288,44 @@ def fetch_price_history(ticker: str) -> pd.DataFrame:
     return None
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_fundamental_data(tickers: List[str]) -> pd.DataFrame:
+def fetch_fundamental_data_fallback(tickers: List[str]) -> pd.DataFrame:
+    """Usado apenas se fetch_fii_universe não conseguir dados para algum ticker."""
     dados = {}
-    progress_bar = st.progress(0, text=f"Buscando indicadores fundamentalistas... (0/{len(tickers)})")
-    for i, t in enumerate(tickers, start=1):
-        progress_bar.progress(
-            i / len(tickers),
-            text=f"Buscando indicadores fundamentalistas... ({i}/{len(tickers)}) — {t}"
-        )
-        try:
-            url = f"https://statusinvest.com.br/fundos-imobiliarios/{t.lower()}"
-            resp = requests.get(url, headers=HEADERS, timeout=10, verify=False)
-            if resp.status_code == 200:
-                m_price = re.search(r'"price":\s*([0-9.]+)', resp.text)
-                m_dy = re.search(r'"dividendYield":\s*([0-9.]+)', resp.text)
-                if m_price and m_dy:
-                    dados[t] = {
-                        "Preco": float(m_price.group(1)),
-                        "DY": float(m_dy.group(1)) * 100,
-                        "P/VP": np.nan,
-                        "Vacancia": np.nan,
-                        "Liquidez": np.nan,
-                        "Segmento": "Coletado",
-                    }
-                    continue
-        except Exception:
-            pass
+    for t in tickers:
         if t in STATIC_FUNDAMENTALS.index:
             dados[t] = STATIC_FUNDAMENTALS.loc[t].to_dict()
         else:
             dados[t] = {"Preco": 100.0, "P/VP": 1.0, "DY": 8.0, "Vacancia": 5.0, "Liquidez": 1.0, "Segmento": "Desconhecido"}
-    progress_bar.empty()
     return pd.DataFrame(dados).T
 
 # ============================================================
 # CARREGAMENTO DOS DADOS DE MERCADO (com limite de tickers)
 # ============================================================
 @st.cache_data(ttl=86400, show_spinner=False)
-def load_market_data(max_tickers: int = 50):
-    """Coleta séries macro e preços. max_tickers limita a quantidade para evitar timeout."""
+def load_market_data(max_tickers: int = 400):
+    """Coleta séries macro, universo de FIIs e preços. max_tickers limita a quantidade."""
     logger.info("Coletando séries macroeconômicas...")
     selic = fetch_bcb_series([432, 4189, 1178], "selic")
     ipca12 = fetch_bcb_series([13522], "ipca12")
     ipca_mensal = fetch_bcb_series([433], "ipca")
 
-    # Usa somente tickers estáticos, limitados a max_tickers
-    tickers = sorted(set([t.upper() for t in STATIC_TICKERS if isinstance(t, str) and t.endswith("11")]))
-    tickers = tickers[:max_tickers]
+    # Busca o universo de FIIs ativos e líquidos direto da fonte (sem lista estática fixa)
+    tickers, fundamentals_universo = fetch_fii_universe(max_tickers=max_tickers)
 
     logger.info(f"Coletando preços de {len(tickers)} FIIs...")
     price_hist = {}
     erros = []
+    hoje = pd.Timestamp.today().normalize()
+    limite_defasagem = hoje - pd.Timedelta(days=25)  # ~15-17 dias úteis sem negociar = fundo parado
     progress_bar = st.progress(0, text=f"Buscando preços de {len(tickers)} fundos... (0/{len(tickers)})")
     concluidos = 0
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=15) as executor:
         future_to_ticker = {executor.submit(fetch_price_history, t): t for t in tickers}
         for future in as_completed(future_to_ticker):
             ticker = future_to_ticker[future]
             try:
                 df = future.result()
-                if df is not None and len(df) > 10:
+                if df is not None and len(df) > 10 and pd.to_datetime(df["Date"]).max() >= limite_defasagem:
                     price_hist[ticker] = df
                 else:
                     erros.append(ticker)
@@ -263,10 +339,10 @@ def load_market_data(max_tickers: int = 50):
     progress_bar.empty()
 
     if erros:
-        logger.warning(f"Falha na coleta de preços para {len(erros)} FIIs: {erros[:10]}...")
+        logger.warning(f"Falha na coleta de preços (ou fundo sem negociação recente) para {len(erros)} FIIs: {erros[:10]}...")
     TICKERS_VALIDOS = list(price_hist.keys())
-    logger.info(f"FIIs com dados reais: {len(TICKERS_VALIDOS)}")
-    return selic, ipca12, ipca_mensal, price_hist, TICKERS_VALIDOS
+    logger.info(f"FIIs com dados reais e recentes: {len(TICKERS_VALIDOS)}")
+    return selic, ipca12, ipca_mensal, price_hist, TICKERS_VALIDOS, fundamentals_universo
 
 # ============================================================
 # FEATURES E DATASET HISTÓRICO
@@ -391,6 +467,23 @@ def build_historical_dataset(price_hist, selic, ipca12, ipca_mensal):
 # ============================================================
 INTERACTIONS_PATH = "user_interactions.csv"
 RAW_DATASET_PATH = "fii_raw_dataset.csv"
+MODEL_META_PATH = "model_meta.json"
+
+def load_model_meta():
+    if os.path.exists(MODEL_META_PATH):
+        try:
+            with open(MODEL_META_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_model_meta(meta: dict):
+    try:
+        with open(MODEL_META_PATH, "w") as f:
+            json.dump(meta, f)
+    except Exception as e:
+        logger.warning(f"Não foi possível salvar metadados do modelo: {e}")
 
 def load_interactions():
     if os.path.exists(INTERACTIONS_PATH):
@@ -669,6 +762,21 @@ def main():
     capital = st.sidebar.number_input(
         "Capital para investir (R$)", min_value=100.0, value=10000.0, step=1.0, format="%.2f"
     )
+    patrimonio_total = st.sidebar.number_input(
+        "Patrimônio total (opcional, R$)", min_value=0.0, value=0.0, step=1.0, format="%.2f",
+        help="Usado apenas para te avisar se o valor acima passa de ~25% do seu patrimônio total."
+    )
+    if patrimonio_total > 0:
+        limite_25 = patrimonio_total * 0.25
+        if capital > limite_25:
+            st.sidebar.warning(
+                f"⚠️ R$ {capital:,.2f} é mais do que 25% do seu patrimônio informado "
+                f"(R$ {limite_25:,.2f}). O recomendado geralmente é destinar **até ~25%** "
+                "do patrimônio total a FIIs, para manter diversificação com outras classes de ativo."
+            )
+    else:
+        st.sidebar.caption("💡 Regra geral: destine no máximo ~25% do seu patrimônio total a FIIs.")
+
     profile = st.sidebar.selectbox("Perfil do investidor", ["conservador", "moderado", "agressivo"], index=1)
     objective = st.sidebar.selectbox("Objetivo", ["renda", "valorização", "equilíbrio"], index=0)
 
@@ -681,17 +789,40 @@ def main():
         horizon_months = int(horizon_years * 12)
 
     n_fiis = st.sidebar.slider("Quantidade de FIIs no ranking", min_value=5, max_value=30, value=10, step=1)
+    criterio_alocacao = st.sidebar.radio(
+        "Dividir o capital por:",
+        ["Adequação ao perfil", "Chance de sucesso"],
+        index=0,
+        help="Adequação ao perfil considera seu objetivo e tolerância a risco. "
+             "Chance de sucesso olha só a probabilidade de o preço não cair no horizonte escolhido — "
+             "por isso o fundo mais indicado pode não ser o de maior alocação e vice-versa."
+    )
     run_button = st.sidebar.button("🚀 Executar Análise", type="primary")
+    retrain_clicked = st.sidebar.button("🔄 Retreinar Modelos (busca tudo de novo)")
+
+    meta = load_model_meta()
+    if meta.get("last_trained"):
+        st.sidebar.caption(f"🕒 Último treino do modelo: {meta['last_trained']}")
+    else:
+        st.sidebar.caption("🕒 Modelo ainda não foi treinado nesta instância.")
+
+    if retrain_clicked:
+        fetch_fii_universe.clear()
+        load_market_data.clear()
+        for key in ["raw_all", "models", "calibrations"]:
+            st.session_state.pop(key, None)
+        if os.path.exists(RAW_DATASET_PATH):
+            os.remove(RAW_DATASET_PATH)
 
     with st.status("🔎 Estamos buscando o melhor para você...", expanded=True) as status:
-        status.write("Carregando dados de mercado (Selic, IPCA e preços dos fundos)...")
-        selic, ipca12, ipca_mensal, price_hist, tickers_validos = load_market_data(max_tickers=50)
-        status.write(f"✅ Dados de mercado obtidos para {len(tickers_validos)} fundos.")
+        status.write("Carregando dados de mercado (Selic, IPCA, universo de FIIs e preços)...")
+        selic, ipca12, ipca_mensal, price_hist, tickers_validos, fundamentals_universo = load_market_data(max_tickers=400)
+        status.write(f"✅ Dados de mercado obtidos para {len(tickers_validos)} fundos ativos e líquidos.")
 
         if "raw_all" not in st.session_state:
             raw_file = load_raw_dataset()
             if raw_file.empty:
-                status.write("Construindo base histórica (isso só acontece na primeira vez)...")
+                status.write("Construindo base histórica (isso só acontece na primeira vez ou após retreinar)...")
                 raw_all = build_historical_dataset(price_hist, selic, ipca12, ipca_mensal)
                 save_raw_dataset(raw_all)
             else:
@@ -714,12 +845,14 @@ def main():
     train_for_bins = raw_all[raw_all["Date"] <= cutoff_date]
     edges = {col: get_quantile_edges(train_for_bins[col], q=4) for col in FEATURES_CONT}
 
-    if "models" not in st.session_state or st.sidebar.button("🔄 Retreinar Modelos"):
+    if "models" not in st.session_state:
         with st.status("🧠 Treinando as redes bayesianas...", expanded=True) as status:
             status.write("Isso analisa o histórico de todos os fundos para aprender padrões de risco e retorno.")
             models, calibrations = train_models_for_all_horizons(raw_all, edges)
             st.session_state.models = models
             st.session_state.calibrations = calibrations
+            agora_str = pd.Timestamp.now().strftime("%d/%m/%Y às %H:%M")
+            save_model_meta({"last_trained": agora_str, "n_fiis_universo": len(tickers_validos)})
             status.update(label="✅ Modelos treinados", state="complete", expanded=False)
     models = st.session_state.models
     calibrations = st.session_state.calibrations
@@ -728,9 +861,16 @@ def main():
         st.error("Não foi possível treinar nenhum modelo. Verifique os dados.")
         return
 
-    with st.status("📊 Buscando indicadores fundamentalistas dos fundos...", expanded=True) as status:
-        fundamental_df = fetch_fundamental_data(tickers_validos)
-        status.update(label="✅ Indicadores fundamentalistas prontos", state="complete", expanded=False)
+    # Fundamentos já vieram junto com o universo de FIIs (uma única requisição);
+    # só precisamos buscar via fallback caso algum ticker válido tenha ficado de fora.
+    faltantes = [t for t in tickers_validos if t not in fundamentals_universo.index]
+    if faltantes:
+        fallback_df = fetch_fundamental_data_fallback(faltantes)
+        fundamental_df = pd.concat([fundamentals_universo, fallback_df])
+    else:
+        fundamental_df = fundamentals_universo
+    fundamental_df = fundamental_df.loc[tickers_validos]
+
     current_raw = raw_all[raw_all["Ticker"].isin(tickers_validos)].sort_values("Date").groupby("Ticker").tail(1).copy()
     current_raw = current_raw.set_index("Ticker")
 
@@ -824,10 +964,12 @@ def main():
     proj_df = pd.DataFrame(projections).set_index("Ticker")
     top_df = top_df.join(proj_df)
     top_df["Div_Anual_Estimado"] = top_df["Preco"] * top_df["DY"] / 100
+    top_df["Chance_Sucesso"] = 1 - top_df["Prob_Queda"]
 
-    # Aloca o capital do usuário proporcionalmente à Adequação de cada fundo no ranking.
+    # Aloca o capital do usuário proporcionalmente ao critério escolhido na barra lateral.
     # Depois converte para nº de cotas inteiras (arredondando pra baixo) ao preço atual.
-    peso = top_df["Adequação"].clip(lower=0)
+    coluna_peso = "Adequação" if criterio_alocacao == "Adequação ao perfil" else "Chance_Sucesso"
+    peso = top_df[coluna_peso].clip(lower=0)
     if peso.sum() > 0:
         peso = peso / peso.sum()
     else:
@@ -835,7 +977,6 @@ def main():
     top_df["Valor_Alocado"] = peso * capital
     top_df["Cotas_Estimadas"] = np.floor(top_df["Valor_Alocado"] / top_df["Preco"]).astype(int)
     top_df["Valor_Alocado"] = top_df["Cotas_Estimadas"] * top_df["Preco"]
-    top_df["Chance_Sucesso"] = 1 - top_df["Prob_Queda"]
 
     display_df = top_df[[
         "Segmento", "Preco", "P/VP", "DY", "Vacancia", "Liquidez",
@@ -869,8 +1010,33 @@ def main():
         st.caption(
             f"💰 Total alocado: R$ {valor_investido_total:,.2f} de R$ {capital:,.2f} "
             f"(R$ {sobra:,.2f} não alocado por arredondamento de cotas inteiras). "
-            "A divisão entre fundos é proporcional à Adequação de cada um ao seu perfil — "
-            "considere isso um ponto de partida, não uma recomendação definitiva."
+            f"A divisão entre fundos é proporcional à **{criterio_alocacao}** de cada um — "
+            "por isso o fundo com maior alocação nem sempre é o de maior chance de sucesso "
+            "(e vice-versa), já que são critérios diferentes. Considere isso um ponto de "
+            "partida, não uma recomendação definitiva."
+        )
+
+        st.markdown("#### 📝 Por que esses fundos foram indicados")
+        for t in top_df.head(5).index:
+            r = top_df.loc[t]
+            motivos = []
+            if fund_percentiles.loc[t, "pct_dy"] >= 0.7:
+                motivos.append("dividend yield entre os mais altos do ranking")
+            if fund_percentiles.loc[t, "pct_pvp"] <= 0.3:
+                motivos.append("negociado com desconto sobre o valor patrimonial (P/VP baixo)")
+            if fund_percentiles.loc[t, "pct_vac"] <= 0.3:
+                motivos.append("vacância baixa em relação aos demais")
+            if fund_percentiles.loc[t, "pct_liq"] >= 0.7:
+                motivos.append("boa liquidez diária, facilitando compra e venda")
+            if r["Retorno_Esperado"] > 0:
+                motivos.append(f"projeção de valorização de {r['Retorno_Esperado']:+.1%} no horizonte escolhido")
+            if not motivos:
+                motivos.append("bom equilíbrio geral entre os indicadores analisados")
+            st.markdown(f"**{t}** ({r['Segmento']}): " + "; ".join(motivos) + ".")
+        st.caption(
+            "Resumo gerado a partir dos indicadores calculados (percentis de DY, P/VP, vacância "
+            "e liquidez do próprio ranking) — não é uma análise qualitativa de notícias ou fatos "
+            "relevantes do fundo."
         )
 
         now = pd.Timestamp.now()
