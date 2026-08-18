@@ -1,0 +1,10 @@
+streamlit
+pgmpy
+pandas-datareader
+beautifulsoup4
+requests
+scikit-learn
+matplotlib
+seaborn
+yfinance
+python-bcb
