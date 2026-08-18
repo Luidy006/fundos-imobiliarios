@@ -8,3 +8,4 @@ matplotlib
 seaborn
 yfinance
 python-bcb
+pgmpy==0.1.23
