@@ -666,10 +666,20 @@ def adjust_score(row, current_df, profile, objective, horizon):
 # ============================================================
 def main():
     st.sidebar.header("🔍 Parâmetros da Análise")
-    capital = st.sidebar.number_input("Capital para investir (R$)", min_value=1000, value=10000, step=1000)
+    capital = st.sidebar.number_input(
+        "Capital para investir (R$)", min_value=100.0, value=10000.0, step=1.0, format="%.2f"
+    )
     profile = st.sidebar.selectbox("Perfil do investidor", ["conservador", "moderado", "agressivo"], index=1)
     objective = st.sidebar.selectbox("Objetivo", ["renda", "valorização", "equilíbrio"], index=0)
-    horizon = st.sidebar.selectbox("Horizonte de investimento", ["curto", "médio", "longo"], index=1)
+
+    st.sidebar.markdown("**Horizonte de investimento**")
+    unidade_horizonte = st.sidebar.radio("Unidade", ["Meses", "Anos"], index=1, horizontal=True, label_visibility="collapsed")
+    if unidade_horizonte == "Meses":
+        horizon_months = st.sidebar.number_input("Quantidade de meses", min_value=1, max_value=360, value=36, step=1)
+    else:
+        horizon_years = st.sidebar.number_input("Quantidade de anos", min_value=1, max_value=30, value=3, step=1)
+        horizon_months = int(horizon_years * 12)
+
     n_fiis = st.sidebar.slider("Quantidade de FIIs no ranking", min_value=5, max_value=30, value=10, step=1)
     run_button = st.sidebar.button("🚀 Executar Análise", type="primary")
 
@@ -754,8 +764,18 @@ def main():
             lambda x: x if x in STATE_LABELS[col] else STATE_LABELS[col][-1]
         )
 
-    horizon_months = {"curto": 12, "médio": 36, "longo": 120}[horizon]
-    bn_probs = get_current_predictions(models, calibrations, current_discrete, horizon_months)
+    # BN foi treinado apenas para horizontes fixos (3, 12, 36, 120 meses);
+    # usamos o modelo mais próximo do horizonte livre escolhido pelo usuário.
+    bn_horizon_months = min(HORIZONS_MONTHS, key=lambda h: abs(h - horizon_months))
+    bn_probs = get_current_predictions(models, calibrations, current_discrete, bn_horizon_months)
+
+    # Bucket textual do horizonte, usado apenas para ajustar o score por perfil/objetivo
+    if horizon_months <= 18:
+        horizon = "curto"
+    elif horizon_months <= 72:
+        horizon = "médio"
+    else:
+        horizon = "longo"
 
     fund_percentiles = pd.DataFrame({
         "pct_pvp": fundamental_df["P/VP"].rank(pct=True),
@@ -805,23 +825,53 @@ def main():
     top_df = top_df.join(proj_df)
     top_df["Div_Anual_Estimado"] = top_df["Preco"] * top_df["DY"] / 100
 
+    # Aloca o capital do usuário proporcionalmente à Adequação de cada fundo no ranking.
+    # Depois converte para nº de cotas inteiras (arredondando pra baixo) ao preço atual.
+    peso = top_df["Adequação"].clip(lower=0)
+    if peso.sum() > 0:
+        peso = peso / peso.sum()
+    else:
+        peso = pd.Series(1 / len(top_df), index=top_df.index)
+    top_df["Valor_Alocado"] = peso * capital
+    top_df["Cotas_Estimadas"] = np.floor(top_df["Valor_Alocado"] / top_df["Preco"]).astype(int)
+    top_df["Valor_Alocado"] = top_df["Cotas_Estimadas"] * top_df["Preco"]
+    top_df["Chance_Sucesso"] = 1 - top_df["Prob_Queda"]
+
     display_df = top_df[[
         "Segmento", "Preco", "P/VP", "DY", "Vacancia", "Liquidez",
-        "Div_Anual_Estimado", "Adequação", "Preco_Projetado",
-        "Retorno_Esperado", "Prob_Queda"
+        "Div_Anual_Estimado", "Adequação", "Valor_Alocado", "Cotas_Estimadas",
+        "Chance_Sucesso", "Preco_Projetado", "Retorno_Esperado", "Prob_Queda"
     ]].copy()
     display_df["Liquidez"] = display_df["Liquidez"].apply(lambda x: f"R$ {x:.2f} mi")
     display_df["DY"] = display_df["DY"].apply(lambda x: f"{x:.1f}%")
     display_df["Vacancia"] = display_df["Vacancia"].apply(lambda x: f"{x:.1f}%")
+    display_df["Valor_Alocado"] = display_df["Valor_Alocado"].apply(lambda x: f"R$ {x:,.2f}")
+    display_df["Chance_Sucesso"] = display_df["Chance_Sucesso"].apply(lambda x: f"{x:.1%}")
     display_df["Div_Anual_Estimado"] = display_df["Div_Anual_Estimado"].apply(lambda x: f"R$ {x:.2f}")
     display_df["Adequação"] = display_df["Adequação"].apply(lambda x: f"{x:.2%}")
     display_df["Retorno_Esperado"] = display_df["Retorno_Esperado"].apply(lambda x: f"{x:+.2%}")
     display_df["Prob_Queda"] = display_df["Prob_Queda"].apply(lambda x: f"{x:.2%}")
     display_df["Preco_Projetado"] = display_df["Preco_Projetado"].apply(lambda x: f"R$ {x:.2f}")
+    display_df = display_df.rename(columns={
+        "Preco": "Preço Atual", "Vacancia": "Vacância", "Liquidez": "Liquidez Diária",
+        "Div_Anual_Estimado": "Div. Anual Estimado", "Adequação": "Adequação ao Perfil",
+        "Valor_Alocado": "Valor a Investir", "Cotas_Estimadas": "Cotas",
+        "Chance_Sucesso": "Chance de Sucesso", "Preco_Projetado": "Preço Projetado",
+        "Retorno_Esperado": "Retorno Esperado", "Prob_Queda": "Prob. de Queda",
+    })
+
+    valor_investido_total = top_df["Valor_Alocado"].sum()
+    sobra = capital - valor_investido_total
 
     if run_button:
-        st.success(f"Análise concluída para **{profile}**, **{objective}**, horizonte **{horizon}**.")
+        st.success(f"Análise concluída para **{profile}**, **{objective}**, horizonte **{horizon_months} meses**.")
         st.dataframe(display_df, use_container_width=True)
+        st.caption(
+            f"💰 Total alocado: R$ {valor_investido_total:,.2f} de R$ {capital:,.2f} "
+            f"(R$ {sobra:,.2f} não alocado por arredondamento de cotas inteiras). "
+            "A divisão entre fundos é proporcional à Adequação de cada um ao seu perfil — "
+            "considere isso um ponto de partida, não uma recomendação definitiva."
+        )
 
         now = pd.Timestamp.now()
         target_date = now + pd.DateOffset(months=horizon_months)
