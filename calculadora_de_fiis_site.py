@@ -1115,5 +1115,92 @@ def main():
             ax.legend()
             st.pyplot(fig)
 
+    # ============================================================
+    # CHAT COM IA — TIRE DÚVIDAS SOBRE A RECOMENDAÇÃO
+    # ============================================================
+    st.divider()
+    st.markdown("### 💬 Converse com a IA sobre a recomendação")
+    st.caption(
+        "Pergunte sobre os fundos do ranking, o que significam os indicadores, "
+        "ou peça para comparar dois FIIs. A IA responde com base apenas nos "
+        "dados calculados acima — não é uma recomendação de investimento."
+    )
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    def montar_contexto_para_ia(top_df, profile, objective, horizon_months, criterio_alocacao):
+        linhas = [
+            f"Perfil do investidor: {profile}",
+            f"Objetivo: {objective}",
+            f"Horizonte: {horizon_months} meses",
+            f"Critério de alocação escolhido: {criterio_alocacao}",
+            "",
+            "Ranking atual de FIIs recomendados (do melhor para o pior colocado):",
+        ]
+        for t in top_df.index:
+            r = top_df.loc[t]
+            linhas.append(
+                f"- {t} ({r['Segmento']}): Preço R$ {r['Preco']:.2f}, "
+                f"P/VP {r['P/VP']:.2f}, DY {r['DY']:.1f}%, Vacância {r['Vacancia']:.1f}%, "
+                f"Adequação ao perfil {r['Adequação']:.1%}, "
+                f"Chance de sucesso {r['Chance_Sucesso']:.1%}, "
+                f"Retorno esperado {r['Retorno_Esperado']:+.1%}, "
+                f"Valor a investir R$ {r['Valor_Alocado']:.2f} ({r['Cotas_Estimadas']} cotas)."
+            )
+        return "\n".join(linhas)
+
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    pergunta = st.chat_input("Pergunte algo sobre os fundos recomendados...")
+    if pergunta:
+        st.session_state.chat_history.append({"role": "user", "content": pergunta})
+        with st.chat_message("user"):
+            st.markdown(pergunta)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Pensando..."):
+                try:
+                    import anthropic  # import local, usado só aqui
+                    api_key = st.secrets.get("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY"))
+                    if not api_key:
+                        resposta = (
+                            "⚠️ Nenhuma chave de API configurada. Adicione `ANTHROPIC_API_KEY` "
+                            "em Settings → Secrets no Streamlit Cloud para habilitar o chat."
+                        )
+                    else:
+                        client = anthropic.Anthropic(api_key=api_key)
+                        contexto = montar_contexto_para_ia(
+                            top_df, profile, objective, horizon_months, criterio_alocacao
+                        )
+                        system_prompt = (
+                            "Você é um assistente que ajuda o usuário a entender o ranking de "
+                            "Fundos Imobiliários (FIIs) gerado pelo app dele. Responda em português, "
+                            "de forma clara e objetiva, com base SOMENTE nos dados fornecidos abaixo. "
+                            "Se a pergunta não puder ser respondida com esses dados, diga isso. "
+                            "Nunca dê recomendação de compra/venda como certeza — deixe claro que é "
+                            "uma ferramenta de apoio, não uma recomendação financeira.\n\n"
+                            f"{contexto}"
+                        )
+                        historico_api = [
+                            {"role": m["role"], "content": m["content"]}
+                            for m in st.session_state.chat_history
+                        ]
+                        response = client.messages.create(
+                            model="claude-sonnet-4-6",
+                            max_tokens=1000,
+                            system=system_prompt,
+                            messages=historico_api,
+                        )
+                        resposta = "".join(
+                            block.text for block in response.content if block.type == "text"
+                        )
+                except Exception as e:
+                    resposta = f"⚠️ Não foi possível obter resposta da IA agora ({e})."
+
+                st.markdown(resposta)
+        st.session_state.chat_history.append({"role": "assistant", "content": resposta})
 if __name__ == "__main__":
     main()
